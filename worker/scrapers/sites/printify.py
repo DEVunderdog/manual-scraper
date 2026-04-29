@@ -63,6 +63,40 @@ DEFAULT_CONCURRENCY = 8  # max simultaneous HTTP requests (legacy fallback)
 DEFAULT_REQUEST_DELAY = 0.05  # seconds between releasing semaphore slots
 DIRECT_STORE_THRESHOLD = 200  # blueprints above which we store directly to DB
 
+# ─── Provider country allowlist ──────────────────────────────────────────────
+# Only providers whose location resolves to one of these ISO-3166 alpha-2
+# country codes will be scraped. Extend this set to include more countries.
+ALLOWED_PROVIDER_COUNTRIES = {"US"}
+
+# Maps Printify's `countryName` (full names returned by
+# /api/v1/print-providers) to ISO-3166 alpha-2 codes. Only entries we
+# care about are listed; unknown names fall through to the raw value.
+_COUNTRY_NAME_TO_ISO = {
+    "US": "US",
+    "USA": "US",
+    "U.S.": "US",
+    "U.S.A.": "US",
+    "United States": "US",
+    "United States of America": "US",
+}
+
+
+def _country_to_iso(country_name: str) -> str:
+    """Best-effort normalization of a country name/code to ISO-3166 alpha-2.
+
+    Returns the mapped code if known, otherwise the original (stripped) value
+    so callers can still compare against an allowlist that uses raw names.
+    """
+    if not country_name:
+        return ""
+    name = country_name.strip()
+    if name in _COUNTRY_NAME_TO_ISO:
+        return _COUNTRY_NAME_TO_ISO[name]
+    # If it already looks like a 2-letter code, normalize to upper-case.
+    if len(name) == 2 and name.isalpha():
+        return name.upper()
+    return name
+
 
 @register_scraper(
     site_id="printify",
@@ -353,6 +387,7 @@ class PrintifyScraper(BaseScraper):
             return [], 0
 
         products: List[Dict] = []
+        kept_providers = 0
 
         for prov_stub in bp_providers:
             pid = prov_stub.get("id")
@@ -360,6 +395,23 @@ class PrintifyScraper(BaseScraper):
                 continue
 
             prov_info = provider_map.get(pid, {})
+
+            # ── Country allowlist filter ──────────────────────────────────
+            # Skip non-US providers (or any not in ALLOWED_PROVIDER_COUNTRIES)
+            # *before* making any expensive per-provider detail/variant calls.
+            prov_country_iso = prov_info.get("country_iso", "")
+            if prov_country_iso not in ALLOWED_PROVIDER_COUNTRIES:
+                logger.info(
+                    "printify.provider_skipped_non_us",
+                    provider_id=pid,
+                    country=(
+                        prov_info.get("countryName", "")
+                        or prov_country_iso
+                        or "unknown"
+                    ),
+                )
+                continue
+            kept_providers += 1
 
             if scrape_mode == "providers":
                 # One record per blueprint×provider (summary, no per-variant call)
@@ -436,7 +488,7 @@ class PrintifyScraper(BaseScraper):
                 )
                 products.append(rec)
 
-        return products, len(bp_providers)
+        return products, kept_providers
 
     # ──────────────────────────────────────────────────────────────────────────
     # Record builders
@@ -603,6 +655,7 @@ class PrintifyScraper(BaseScraper):
             p["id"]: {
                 "name": p.get("name", ""),
                 "countryName": p.get("countryName", ""),
+                "country_iso": _country_to_iso(p.get("countryName", "")),
                 "scoring": p.get("scoring", {}),
                 "productsCount": p.get("productsCount", 0),
             }
