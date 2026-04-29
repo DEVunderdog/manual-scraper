@@ -24,10 +24,13 @@ class ChangeTrackingRepository:
     - Products no longer present in source (DELETED)
     """
     
-    # Fields to exclude from change comparison (metadata/timestamps)
+    # Fields to exclude from change comparison (metadata/timestamps).
+    # MUST stay aligned with ProductRepository._compute_data_hash so the
+    # hashes computed on either side of the boundary agree byte-for-byte.
     EXCLUDE_FIELDS = {
-        "_id", "created_at", "updated_at", "last_task_id", 
-        "last_scraped_at", "scrape_count"
+        "_id", "created_at", "updated_at", "last_task_id",
+        "last_scraped_at", "scrape_count", "data_hash",
+        "deleted_at", "deleted_by_task",
     }
     
     def __init__(self, db):

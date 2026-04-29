@@ -720,8 +720,10 @@ const ExportPanel = ({ isOpen, onClose }) => {
         });
       }
 
-      const blob = new Blob([response.data], { type: "text/csv" });
-      const url = window.URL.createObjectURL(blob);
+      // axios returns response.data as a Blob already (responseType: 'blob').
+      // Wrapping it in another `new Blob([...])` is unnecessary and would
+      // sometimes corrupt the download for streamed CSV; use it directly.
+      const url = window.URL.createObjectURL(response.data);
       const a = document.createElement("a");
       a.href = url;
       const sourceLabel = source ? `_${source}` : "";

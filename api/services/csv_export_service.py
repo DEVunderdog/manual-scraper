@@ -533,7 +533,13 @@ class CSVExportService:
         # Build query
         query = {}
         if source:
-            query["source"] = source.lower()
+            # NOTE: change records store ``source`` exactly as the scraper
+            # registered it (always lowercase by convention — see
+            # ``register_scraper`` site_id values). Do NOT force-lowercase
+            # the filter here: if a caller ever filters on a source whose
+            # canonical id is mixed-case, lowercasing silently drops every
+            # match. Trust the caller; the registry is the source of truth.
+            query["source"] = source
         if change_type:
             query["change_type"] = change_type
 
@@ -702,7 +708,7 @@ class CSVExportService:
             {
                 "$match": {
                     "created_at": {"$gte": start_date},
-                    **({"source": source.lower()} if source else {}),
+                    **({"source": source} if source else {}),
                 }
             },
             {

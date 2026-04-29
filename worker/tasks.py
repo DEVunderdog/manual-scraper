@@ -298,7 +298,41 @@ def execute_scraping(
         products = _extract_products_from_result(result.data)
         change_tracking_result = None
 
-        if products:
+        # Scrapers that already persisted products themselves (e.g. Printify
+        # via the streaming-tracked-writer path) signal it via
+        # ``data.stored_directly``. In that case we MUST NOT re-run the
+        # change-tracking pipeline here — it would create duplicate records
+        # against an already-mutated DB state. Instead we surface the
+        # tracking summary the scraper provided.
+        stored_directly = bool(
+            (result.data or {}).get("stored_directly")
+        ) if isinstance(result.data, dict) else False
+
+        if stored_directly:
+            scraper_changes = (result.data or {}).get("change_tracking") or {}
+            change_tracking_result = {
+                "storage": {
+                    "inserted": 0,
+                    "updated": 0,
+                    "failed": 0,
+                },
+                "changes": {
+                    "added": scraper_changes.get("added", 0),
+                    "updated": scraper_changes.get("updated", 0),
+                    "deleted": scraper_changes.get("deleted", 0),
+                    "unchanged": scraper_changes.get("unchanged", 0),
+                    "soft_deleted": scraper_changes.get("soft_deleted", 0),
+                },
+                "is_partial": False,
+            }
+            log.info(
+                "task.change_tracking_inherited_from_scraper",
+                task_id=task_id,
+                site=result.site,
+                **change_tracking_result["changes"],
+            )
+
+        elif products:
             # Create a scrape session for tracking
             session_id = self.product_repo.create_scrape_session(
                 source=result.site,
@@ -353,8 +387,13 @@ def execute_scraping(
         published_data = {}
         if change_tracking_result:
             published_data["_change_tracking"] = {
-                "products_processed": len(products),
+                "products_processed": (
+                    (result.data or {}).get("products_count", 0)
+                    if stored_directly
+                    else len(products)
+                ),
                 "is_partial": change_tracking_result.get("is_partial", False),
+                "stored_directly": stored_directly,
                 "added": change_tracking_result["changes"]["added"],
                 "updated": change_tracking_result["changes"]["updated"],
                 "deleted": change_tracking_result["changes"]["deleted"],

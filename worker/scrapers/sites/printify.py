@@ -220,6 +220,16 @@ class PrintifyScraper(BaseScraper):
         provider_map: Dict[int, Dict],
         scrape_mode: str,
     ) -> Dict[str, Any]:
+        """
+        Stream-scrape each blueprint to MongoDB in batches *with full change
+        tracking*.
+
+        Old behavior just upserted each batch with no tracking and never
+        deleted stale catalog entries — see
+        ``ProductRepository.streaming_tracked_writer`` for the new semantics:
+        ADDED / UPDATED / UNCHANGED detection per batch with a single
+        soft-delete sweep over stale snapshot keys at the end.
+        """
         from worker.database.product import ProductRepository
 
         product_repo = ProductRepository(self._db)
@@ -227,10 +237,16 @@ class PrintifyScraper(BaseScraper):
             source="printify", task_id=self._task_id, scrape_type="full"
         )
 
-        total_products = 0
+        writer = product_repo.streaming_tracked_writer(
+            source="printify",
+            task_id=self._task_id,
+            session_id=session_id,
+        )
+
         total_providers = 0
-        batch: List[Dict] = []
-        BATCH_SIZE = 500  # flush to DB every N records
+        BATCH_SIZE = 500
+        buf: List[Dict] = []
+        blueprint_count = len(blueprints)
 
         for idx, blueprint in enumerate(blueprints):
             self._check_cancelled()
@@ -238,28 +254,32 @@ class PrintifyScraper(BaseScraper):
             bp_products, bp_providers = await self._scrape_blueprint(
                 client, semaphore, blueprint, provider_map, scrape_mode
             )
-            batch.extend(bp_products)
             total_providers += bp_providers
+            buf.extend(bp_products)
 
             logger.info(
                 "printify.blueprint.done",
                 blueprint_id=blueprint.get("blueprintId"),
                 name=blueprint.get("name", ""),
                 variants=len(bp_products),
-                progress=f"{idx + 1}/{len(blueprints)}",
+                progress=f"{idx + 1}/{blueprint_count}",
             )
 
-            # Flush batch
-            if len(batch) >= BATCH_SIZE:
-                product_repo.store_products_bulk("printify", batch, self._task_id)
-                total_products += len(batch)
-                logger.info("printify.batch_stored", stored=total_products)
-                batch = []
+            # Drain the buffer into the writer in BATCH_SIZE chunks. The
+            # writer's per-batch ops are sync and will briefly block the
+            # event loop — same pattern the legacy direct-storage path used
+            # for ``store_products_bulk``.
+            while len(buf) >= BATCH_SIZE:
+                writer.process_batch(buf[:BATCH_SIZE])
+                buf = buf[BATCH_SIZE:]
 
-        # Flush remaining
-        if batch:
-            product_repo.store_products_bulk("printify", batch, self._task_id)
-            total_products += len(batch)
+        if buf:
+            writer.process_batch(buf)
+
+        result = writer.finalize()
+        total_products = (
+            result["storage"]["inserted"] + result["storage"]["updated"]
+        )
 
         product_repo.update_scrape_session(
             session_id=session_id,
@@ -270,17 +290,30 @@ class PrintifyScraper(BaseScraper):
 
         logger.info(
             "printify.scrape_complete",
-            blueprints=len(blueprints),
+            blueprints=blueprint_count,
             products=total_products,
+            added=result["changes"]["added"],
+            updated=result["changes"]["updated"],
+            deleted=result["changes"]["deleted"],
+            unchanged=result["changes"]["unchanged"],
         )
 
         return {
-            "products": [],  # already stored – task will skip storage
-            "blueprints_scraped": len(blueprints),
+            "products": [],  # already stored — task must NOT re-store
+            "blueprints_scraped": blueprint_count,
             "providers_scraped": total_providers,
             "products_count": total_products,
-            "is_partial_scrape": True,  # prevent task from soft-deleting
+            # Full-catalog run: NOT a partial scrape. The streaming writer
+            # has already pruned stale entries via soft-delete.
+            "is_partial_scrape": False,
             "stored_directly": True,
+            "change_tracking": {
+                "added": result["changes"]["added"],
+                "updated": result["changes"]["updated"],
+                "deleted": result["changes"]["deleted"],
+                "unchanged": result["changes"]["unchanged"],
+                "soft_deleted": result["changes"]["soft_deleted"],
+            },
         }
 
     # ──────────────────────────────────────────────────────────────────────────
