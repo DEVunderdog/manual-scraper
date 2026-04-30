@@ -540,13 +540,23 @@ class ProductRepository:
         source: str,
         task_id: Optional[str] = None,
         session_id: Optional[str] = None,
+        is_partial: bool = False,
     ) -> "StreamingTrackedWriter":
-        """Construct a stateful per-scrape streaming writer (see class doc)."""
+        """Construct a stateful per-scrape streaming writer (see class doc).
+
+        Args:
+            is_partial: If True, ``finalize()`` will SKIP the soft-delete
+                sweep on snapshot-keys-not-seen-in-this-run. Used for
+                capped/single-product runs where only a slice of the
+                catalog is being scraped — pruning would erroneously
+                tombstone every product not in the slice.
+        """
         return StreamingTrackedWriter(
             repo=self,
             source=source,
             task_id=task_id,
             session_id=session_id,
+            is_partial=is_partial,
         )
 
     # ──────────────────────────────────────────────────────────────────────
@@ -619,11 +629,13 @@ class StreamingTrackedWriter:
         source: str,
         task_id: Optional[str] = None,
         session_id: Optional[str] = None,
+        is_partial: bool = False,
     ) -> None:
         self._repo = repo
         self._source = source
         self._task_id = task_id
         self._session_id = session_id
+        self._is_partial = is_partial
         self._tracker = repo._change_tracker
         self._products = repo._products
 
@@ -795,6 +807,11 @@ class StreamingTrackedWriter:
 
         if change_records:
             try:
+                # Layer-3 hardening: cap oversized payloads before insert
+                # so no single audit doc can exceed the 16 MB BSON cap.
+                change_records = [
+                    self._tracker._cap_change_record(r) for r in change_records
+                ]
                 res = self._tracker._changes.insert_many(
                     change_records, ordered=False
                 )
@@ -810,7 +827,13 @@ class StreamingTrackedWriter:
     # ─────────────────────────────────────────────────────────────────────
 
     def finalize(self) -> Dict[str, Any]:
-        """Run soft-delete sweep + post-snapshot, return rollup summary."""
+        """Run soft-delete sweep + post-snapshot, return rollup summary.
+
+        When the writer was constructed with ``is_partial=True``, the
+        soft-delete sweep is skipped — partial runs only saw a slice of
+        the upstream catalog and must not tombstone everything outside
+        that slice.
+        """
         if self._finalized:
             raise RuntimeError(
                 "StreamingTrackedWriter.finalize called twice"
@@ -818,7 +841,7 @@ class StreamingTrackedWriter:
         self._finalized = True
 
         deleted_count = 0
-        if self._snapshot_keys:
+        if self._snapshot_keys and not self._is_partial:
             stale_keys = set(self._snapshot_keys.keys()) - self._active_keys
             if stale_keys:
                 stale_doc_ids = [
@@ -887,6 +910,12 @@ class StreamingTrackedWriter:
 
                 if deleted_records:
                     try:
+                        # Layer-3 hardening: cap oversized old_data
+                        # before inserting DELETED audit rows.
+                        deleted_records = [
+                            self._tracker._cap_change_record(r)
+                            for r in deleted_records
+                        ]
                         res = self._tracker._changes.insert_many(
                             deleted_records, ordered=False
                         )
@@ -938,7 +967,7 @@ class StreamingTrackedWriter:
                 "unchanged": self._change_counts["unchanged"],
                 "soft_deleted": deleted_count,
             },
-            "is_partial": False,
+            "is_partial": self._is_partial,
             "snapshot_id": self._snapshot_id,
             "change_ids": self._change_ids,
         }

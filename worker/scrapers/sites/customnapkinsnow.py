@@ -67,7 +67,7 @@ import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from statistics import median
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -120,6 +120,11 @@ _VARIANT_SOFT_CAP = 500  # hard guardrail against cartesian explosions
 # ---------------------------------------------------------------------------
 _CONCURRENCY_HARD_CAP = 16
 _PER_SLOT_MIN_DELAY_S = 0.2  # minimum interval between request *starts*, per slot
+
+# Batch size for the StreamingTrackedWriter path. Matches the value the
+# Printify scraper uses; tuned to keep each Mongo bulk_write roughly
+# in the 5–10 MB wire envelope range while amortising round-trip cost.
+_DIRECT_STORAGE_BATCH = 500
 _PROGRESS_MIN_INTERVAL_S = 1.0
 _PROGRESS_MIN_STEP_PCT = 1
 
@@ -296,7 +301,6 @@ class CustomNapkinsNowScraper(BaseScraper):
         )
 
         try:
-            products: List[Dict[str, Any]] = []
             is_partial = False
 
             # Single-product mode is triggered when a /product/ URL is present
@@ -307,8 +311,74 @@ class CustomNapkinsNowScraper(BaseScraper):
             # from the HTTP API without changing the orchestration contract.
             override_url = (self.payload.extra or {}).get("url")
             effective_url = override_url or self.payload.url
+            single_product_mode = bool(
+                effective_url and "/product/" in effective_url
+            )
 
-            if effective_url and "/product/" in effective_url:
+            # ── Streaming-storage decision ───────────────────────────────
+            # When we have a live MongoDB handle (the normal worker path)
+            # we route every scraped product through ``StreamingTrackedWriter``
+            # in batches of ``_DIRECT_STORAGE_BATCH``. This avoids ever
+            # materialising the full product list as a single in-memory
+            # object — and, critically, prevents the "21 MB scrape_results
+            # doc → DocumentTooLarge" failure mode for large catalogs
+            # because ``data.products`` becomes ``[]``.
+            #
+            # When ``self._db`` is None (unit tests / dry-run) we fall back
+            # to the legacy in-memory accumulation path.
+            stream_storage = self._db is not None
+            products: List[Dict[str, Any]] = []  # legacy path only
+            change_summary: Optional[Dict[str, int]] = None
+            session_id: Optional[str] = None
+            writer = None
+            buf: List[Dict[str, Any]] = []
+            product_repo = None
+
+            if stream_storage:
+                # Lazy import to keep this module importable in environments
+                # that don't have the worker's repo dependencies set up
+                # (e.g. some unit tests).
+                from worker.database.product import ProductRepository
+
+                product_repo = ProductRepository(self._db)
+                session_id = product_repo.create_scrape_session(
+                    source=self.site_id,
+                    task_id=self._task_id or "",
+                    scrape_type="full" if not single_product_mode else "single",
+                )
+                # is_partial here covers single-product mode AND the
+                # max_products cap (set later inside _scrape_catalog when
+                # applicable). ``finalize()`` honours this flag and skips
+                # the soft-delete sweep for partial runs.
+                writer = product_repo.streaming_tracked_writer(
+                    source=self.site_id,
+                    task_id=self._task_id,
+                    session_id=session_id,
+                    is_partial=single_product_mode,  # may be promoted to True later
+                )
+
+            def _flush_buf(force: bool = False) -> None:
+                """Push the local buffer through the streaming writer
+                whenever it reaches batch size (or on ``force=True`` at
+                the end of the run)."""
+                if writer is None:
+                    return
+                target = _DIRECT_STORAGE_BATCH
+                while len(buf) >= target:
+                    writer.process_batch(buf[:target])
+                    del buf[:target]
+                if force and buf:
+                    writer.process_batch(buf)
+                    buf.clear()
+
+            def _on_product(product: Dict[str, Any]) -> None:
+                if writer is None:
+                    products.append(product)
+                else:
+                    buf.append(product)
+                    _flush_buf(force=False)
+
+            if single_product_mode:
                 is_partial = True
                 self._emit_progress(10, "Fetching product")
                 product = self._scrape_product(
@@ -320,21 +390,64 @@ class CustomNapkinsNowScraper(BaseScraper):
                 )
                 self._emit_progress(80, "Persisting")
                 if product:
-                    products.append(product)
+                    _on_product(product)
                     self.stats["fetched"] = 1
                 self.stats["discovered"] = 1
                 self._emit_progress(100, "Done")
             else:
                 self._emit_progress(0, "Discovering products")
-                products, is_partial = self._scrape_catalog()
+                is_partial = self._scrape_catalog(_on_product)
+                if is_partial and writer is not None:
+                    # Promote partial-run flag so finalize() skips
+                    # soft-delete (matches the legacy contract).
+                    writer._is_partial = True
                 self._emit_progress(100, "Run complete")
+
+            # Final flush + finalize for the streaming path.
+            if writer is not None:
+                _flush_buf(force=True)
+                summary = writer.finalize()
+                change_summary = {
+                    "added": summary["changes"]["added"],
+                    "updated": summary["changes"]["updated"],
+                    "deleted": summary["changes"]["deleted"],
+                    "unchanged": summary["changes"]["unchanged"],
+                    "soft_deleted": summary["changes"]["soft_deleted"],
+                }
+                stored_total = (
+                    summary["storage"]["inserted"]
+                    + summary["storage"]["updated"]
+                )
+                if product_repo is not None and session_id:
+                    product_repo.update_scrape_session(
+                        session_id=session_id,
+                        status="completed",
+                        products_found=stored_total,
+                        products_stored=stored_total,
+                    )
+                products_count = stored_total
+            else:
+                products_count = len(products)
 
             return ScrapeResult(
                 site=self.site_id,
                 url=self.payload.url or self.BASE_URL,
-                data={"products": products, "stats": self.stats},
+                # IMPORTANT: when stream_storage=True we deliberately omit
+                # the products list from ``data`` to keep the scrape_results
+                # doc small. tasks.py inspects ``data.stored_directly`` and
+                # skips its own change-tracking pipeline accordingly.
+                data={
+                    "products": [] if stream_storage else products,
+                    "stats": self.stats,
+                    **({"stored_directly": True} if stream_storage else {}),
+                    **(
+                        {"change_tracking": change_summary}
+                        if change_summary is not None
+                        else {}
+                    ),
+                },
                 metadata={
-                    "products_count": len(products),
+                    "products_count": products_count,
                     "is_partial_scrape": is_partial,
                     "scraped_at": datetime.now(timezone.utc).isoformat(),
                     "schema_version": self.SCHEMA_VERSION,
@@ -366,7 +479,18 @@ class CustomNapkinsNowScraper(BaseScraper):
     # Discovery
     # ------------------------------------------------------------------
 
-    def _scrape_catalog(self) -> Tuple[List[Dict[str, Any]], bool]:
+    def _scrape_catalog(
+        self,
+        on_product: Callable[[Dict[str, Any]], None],
+    ) -> bool:
+        """
+        Discover and scrape every catalog product, dispatching each
+        completed product through ``on_product``.
+
+        Returns:
+            ``is_partial``: ``True`` iff the run was capped via
+            ``payload.extra["max_products"]``.
+        """
         product_urls = self._discover_product_urls()
         self.stats["products_found"] = len(product_urls)
         self.stats["discovered"] = len(product_urls)
@@ -396,36 +520,38 @@ class CustomNapkinsNowScraper(BaseScraper):
 
         # Split into "to_fetch" vs "to_skip_unchanged" based on lastmod.
         to_fetch: List[Dict[str, Any]] = []
-        skipped_unchanged_docs: List[Dict[str, Any]] = []
+        skipped_unchanged_count = 0
         for info in product_urls:
             decision = self._classify_for_skip(info)
             if decision is not None:
-                skipped_unchanged_docs.append(decision)
+                # Re-feed the unchanged stored doc through the callback so
+                # it lands in the writer's ``active_keys`` set (and thus
+                # survives the soft-delete sweep). This matches the
+                # legacy "merged = fetched + skipped_unchanged" contract.
+                on_product(decision)
+                skipped_unchanged_count += 1
                 self.stats["skipped_unchanged"] += 1
             else:
                 to_fetch.append(info)
 
-        if skipped_unchanged_docs:
+        if skipped_unchanged_count:
             logger.info(
                 "customnapkinsnow.lastmod.skipped",
-                count=len(skipped_unchanged_docs),
+                count=skipped_unchanged_count,
                 fetched=len(to_fetch),
                 force_refresh=self.force_refresh,
             )
 
-        # Concurrent fetch pool (async runloop, bounded)
-        fetched_products: List[Dict[str, Any]] = asyncio.run(
-            self._fetch_catalog_async(to_fetch)
+        # Concurrent fetch pool — products stream out via on_product as
+        # they complete, never accumulating into a single in-memory list.
+        asyncio.run(
+            self._fetch_catalog_async(to_fetch, on_product=on_product)
         )
-        self.stats["products_scraped"] = len(fetched_products)
-        self.stats["fetched"] = len(fetched_products)
+        # Note: stats["fetched"] is incremented inside _fetch_catalog_async's
+        # accounting; we no longer have a return-list to len() here.
+        self.stats["products_scraped"] = self.stats.get("fetched", 0)
 
-        # Return union: freshly-scraped v2 products + re-used unchanged docs.
-        # The unchanged docs are hash-equal to the already-stored rows, so
-        # the change-tracker will mark them "unchanged" (no spurious updates)
-        # AND they'll be part of the "alive set" that gates soft-delete.
-        merged: List[Dict[str, Any]] = [*fetched_products, *skipped_unchanged_docs]
-        return merged, is_partial
+        return is_partial
 
     # ------------------------------------------------------------------
     # Lastmod-skip helpers
@@ -525,7 +651,9 @@ class CustomNapkinsNowScraper(BaseScraper):
     # ------------------------------------------------------------------
 
     async def _fetch_catalog_async(
-        self, url_infos: List[Dict[str, Any]]
+        self,
+        url_infos: List[Dict[str, Any]],
+        on_product: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Bounded-concurrency async fetch+parse for every URL in ``url_infos``.
@@ -544,6 +672,13 @@ class CustomNapkinsNowScraper(BaseScraper):
             allowed to complete but their results are discarded.
           * Per-product errors are isolated — they increment
             ``stats["products_failed"]`` and otherwise do not abort the batch.
+
+        When ``on_product`` is provided each completed product is dispatched
+        through the callback INSTEAD of being accumulated in the returned
+        list. The callback is invoked synchronously on the event loop
+        (it must be cheap — typical use is "append to a sync buffer that
+        flushes to Mongo every 500"). This is the streaming-storage hook
+        used by the StreamingTrackedWriter migration.
         """
         if not url_infos:
             return []
@@ -617,7 +752,21 @@ class CustomNapkinsNowScraper(BaseScraper):
                         self._async_cancelled = True
 
                     if product:
-                        results.append(product)
+                        self.stats["fetched"] = self.stats.get("fetched", 0) + 1
+                        if on_product is not None:
+                            try:
+                                on_product(product)
+                            except Exception as cb_exc:
+                                # Callback errors must not crash the worker
+                                # pool; surface them via stats and continue.
+                                logger.error(
+                                    "customnapkinsnow.pool.on_product_callback_error",
+                                    url=info.get("url"),
+                                    error=str(cb_exc),
+                                )
+                                self.stats["products_failed"] += 1
+                        else:
+                            results.append(product)
 
                     pct = 5 + int(95 * completed / max(total, 1))
                     short = (info.get("url") or "").rsplit("/", 1)[-1][:60]

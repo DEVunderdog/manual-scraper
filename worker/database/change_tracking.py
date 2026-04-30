@@ -1,3 +1,4 @@
+import bson
 import structlog
 import hashlib
 from datetime import datetime, timezone
@@ -5,6 +6,16 @@ from typing import Dict, Any, List, Optional, Set
 from enum import StrEnum
 
 logger = structlog.get_logger(__name__)
+
+
+# ── Per-change-record payload caps (Layer 3 hardening) ───────────────────
+# A single ``data_changes`` doc MUST fit under Mongo's 16 MB BSON limit.
+# Worst-case fodder is a product whose serialised shape is very large
+# (e.g. hundreds of variants × tier rows). For such cases we keep the
+# change record (so the audit log is never missing an event) but swap
+# the bulky subfields for a truncation sentinel.
+_MAX_CHANGE_DATA_BYTES = 4 * 1024 * 1024    # 4 MB on new_data / old_data
+_MAX_CHANGE_FIELD_BYTES = 1 * 1024 * 1024   # 1 MB per changed_fields[k] value
 
 
 class ChangeType(StrEnum):
@@ -38,6 +49,90 @@ class ChangeTrackingRepository:
         self._products = db.scraped_products
         self._changes = db.data_changes
         self._snapshots = db.scrape_snapshots
+
+    # ─────────────────────────────────────────────────────────────────
+    # Payload-size hardening
+    # ─────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _bson_size(value: Any) -> int:
+        """Return the BSON-encoded size of an arbitrary value.
+
+        Wrapped in a dict because ``bson.encode`` requires top-level
+        mapping. Returns ``0`` if encoding fails (we treat unencodable
+        values as fine-to-keep — the outer ``insert_many`` will fail
+        loudly later, which is the right behavior for something truly
+        malformed).
+        """
+        try:
+            return len(bson.encode({"_": value}))
+        except Exception:
+            return 0
+
+    @classmethod
+    def _cap_change_record(
+        cls, record: Dict[str, Any], *, log=logger
+    ) -> Dict[str, Any]:
+        """In-place: ensure no single change-record subfield exceeds the
+        configured caps. Returns the (possibly-mutated) record.
+
+        Order of aggression:
+          1. If ``new_data`` > 4 MB → replace with sentinel stub.
+          2. If ``old_data`` > 4 MB → replace with sentinel stub.
+          3. For each ``field_changes.changed_fields[k]``: if its
+             ``old_value`` or ``new_value`` > 1 MB → replace that
+             specific value with a sentinel stub, keep the key so
+             consumers still see that the field changed.
+
+        Every truncation is logged with enough context to reconstruct.
+        """
+        pid = record.get("product_id")
+        ctype = record.get("change_type")
+
+        for side in ("new_data", "old_data"):
+            val = record.get(side)
+            if val is None:
+                continue
+            size = cls._bson_size(val)
+            if size > _MAX_CHANGE_DATA_BYTES:
+                record[side] = {
+                    "payload_truncated": True,
+                    "size_bytes": size,
+                }
+                log.warning(
+                    "change_tracking.record_payload_truncated",
+                    change_type=str(ctype),
+                    product_id=pid,
+                    field=side,
+                    size_bytes=size,
+                    threshold=_MAX_CHANGE_DATA_BYTES,
+                )
+
+        fc = record.get("field_changes")
+        if isinstance(fc, dict):
+            changed = fc.get("changed_fields")
+            if isinstance(changed, dict):
+                for k, diff in list(changed.items()):
+                    if not isinstance(diff, dict):
+                        continue
+                    for vkey in ("old_value", "new_value"):
+                        v = diff.get(vkey)
+                        if v is None:
+                            continue
+                        size = cls._bson_size(v)
+                        if size > _MAX_CHANGE_FIELD_BYTES:
+                            diff[vkey] = {
+                                "payload_truncated": True,
+                                "size_bytes": size,
+                            }
+                            log.warning(
+                                "change_tracking.field_value_truncated",
+                                change_type=str(ctype),
+                                product_id=pid,
+                                field=f"field_changes.changed_fields.{k}.{vkey}",
+                                size_bytes=size,
+                                threshold=_MAX_CHANGE_FIELD_BYTES,
+                            )
+        return record
     
     def _get_product_key(self, product: Dict[str, Any], source: str) -> str:
         """Generate unique key for a product."""
@@ -293,6 +388,11 @@ class ChangeTrackingRepository:
         
         # Insert change records
         if change_records:
+            # Layer-3 hardening: ensure no single doc blows the 16 MB BSON
+            # limit by capping oversized new_data / old_data / field values.
+            change_records = [
+                self._cap_change_record(r) for r in change_records
+            ]
             result = self._changes.insert_many(change_records)
             changes_summary["change_ids"] = [str(id) for id in result.inserted_ids]
         
