@@ -24,6 +24,13 @@ from worker.database.change_tracking import ChangeTrackingRepository, ChangeType
 logger = structlog.get_logger(__name__)
 
 
+# Batch size for the streaming-storage path used by both
+# ``store_products_with_tracking`` (in-memory list caller) and the
+# scraper-driven ``StreamingTrackedWriter``. Same value so memory and
+# round-trip characteristics match across all entry points.
+_IN_MEMORY_BATCH_SIZE = 500
+
+
 class ProductRepository:
     """
     Repository for storing scraped product data.
@@ -370,81 +377,53 @@ class ProductRepository:
         is_partial: bool = False,
     ) -> Dict[str, Any]:
         """
-        Store products and track all changes (added, updated, deleted).
+        Persist + change-track a list of newly-scraped products.
 
-        This is the recommended method for scraper tasks as it provides
-        full change tracking and audit trail.
+        Now a thin adapter onto :class:`StreamingTrackedWriter`: peak Python
+        memory is bounded by *one batch* (default ``_IN_MEMORY_BATCH_SIZE``
+        new products plus their on-demand old-doc fetches) plus the
+        hash-skinny pre-scrape snapshot (~150 bytes per existing key),
+        independent of catalog size.
+
+        Previously this method materialised the entire catalog into Python
+        memory via ``existing_products = list(self._products.find(...))``.
+        For a large-source scraper that's an O(catalog × full_doc_bytes)
+        cliff (would have OOMed any future 50k-product catalog).
+
+        Behavior is byte-identical to the prior implementation for the
+        persisted ``data_changes``, ``scrape_snapshots``, and
+        ``scraped_products`` documents, and the return shape is preserved
+        (every key ``worker/tasks.py`` reads is still present:
+        ``storage.{inserted,updated,failed}``,
+        ``changes.{added,updated,deleted,unchanged,soft_deleted}``,
+        ``is_partial``, ``snapshot_id``, ``change_ids``).
 
         Args:
-            source: Source site identifier
-            products: List of product data dictionaries
-            task_id: Celery task ID
-            session_id: Scrape session ID
-            is_partial: When True (partial/single-product run), soft-deletion
-                        is skipped to avoid incorrectly marking un-scraped
-                        products as deleted.
+            source: Source site identifier.
+            products: List of product data dictionaries.
+            task_id: Celery task ID for audit trail.
+            session_id: Optional scrape session ID for audit trail.
+            is_partial: When True the soft-delete sweep is skipped (partial
+                runs only saw a slice of the upstream catalog and must not
+                tombstone every product outside that slice). Forwarded to
+                ``StreamingTrackedWriter`` which honours it in ``finalize``.
 
         Returns:
-            Dict with storage stats and change summary
+            ``{"storage": {inserted, updated, failed},
+              "changes": {added, updated, deleted, unchanged, soft_deleted},
+              "is_partial": bool,
+              "snapshot_id": str,
+              "change_ids": list[str]}``
         """
-        # Create pre-scrape snapshot
-        snapshot_id = self._change_tracker.create_snapshot(
+        writer = self.streaming_tracked_writer(
             source=source,
             task_id=task_id,
             session_id=session_id,
+            is_partial=is_partial,
         )
-
-        # Track changes before storing
-        changes = self._change_tracker.track_changes(
-            source=source,
-            new_products=products,
-            task_id=task_id,
-            session_id=session_id,
-            snapshot_id=snapshot_id,
-        )
-
-        # Store products (will create or update)
-        storage_stats = self.store_products_bulk(
-            source=source,
-            products=products,
-            task_id=task_id,
-        )
-
-        # Mark deleted products (soft delete) — only for full catalog scrapes.
-        # Partial runs must not trigger deletion of products that were simply
-        # not included in this run.
-        deleted_count = 0
-        if not is_partial:
-            active_keys: Set[str] = set()
-            for product in products:
-                key = self._change_tracker._get_product_key(product, source)
-                active_keys.add(key)
-
-            deleted_count = self._change_tracker.mark_products_for_deletion(
-                source=source,
-                active_product_keys=active_keys,
-                task_id=task_id,
-            )
-        else:
-            logger.info(
-                "products.deletion_skipped",
-                source=source,
-                reason="partial_scrape",
-            )
-
-        return {
-            "storage": storage_stats,
-            "changes": {
-                "added": changes["added"],
-                "updated": changes["updated"],
-                "deleted": changes["deleted"],
-                "unchanged": changes["unchanged"],
-                "soft_deleted": deleted_count,
-            },
-            "is_partial": is_partial,
-            "snapshot_id": snapshot_id,
-            "change_ids": changes["change_ids"],
-        }
+        for i in range(0, len(products), _IN_MEMORY_BATCH_SIZE):
+            writer.process_batch(products[i : i + _IN_MEMORY_BATCH_SIZE])
+        return writer.finalize()
 
     def get_changes(
         self,

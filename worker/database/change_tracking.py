@@ -269,14 +269,25 @@ class ChangeTrackingRepository:
     ) -> Dict[str, Any]:
         """
         Track changes between new scraped data and existing database state.
-        
+
+        .. deprecated::
+            This method holds the entire existing catalog in Python memory
+            via ``list(self._products.find({"source": source}))`` — peak
+            memory is ``O(catalog_size × full_doc_bytes)`` and OOMs for
+            large catalogs. Retained only for direct external callers.
+            New code should drive
+            :class:`worker.database.product.StreamingTrackedWriter`
+            (used internally by ``ProductRepository.store_products_with_tracking``),
+            which is bounded by one batch + a hash-skinny pre-scrape
+            snapshot regardless of catalog size.
+
         Args:
             source: Source site identifier
             new_products: List of newly scraped product data
             task_id: Celery task ID
             session_id: Optional scrape session ID
             snapshot_id: Optional pre-scrape snapshot ID
-        
+
         Returns:
             Summary of changes with counts and change record IDs
         """
@@ -545,7 +556,14 @@ class ChangeTrackingRepository:
         Mark products as deleted that are no longer in the active set.
         
         Instead of hard deleting, sets a 'deleted_at' field.
-        
+
+        .. deprecated::
+            Retained only for direct external callers. The
+            :class:`worker.database.product.StreamingTrackedWriter`
+            soft-delete sweep (in ``finalize()``) covers this responsibility
+            and avoids the second full-collection ``find`` this method
+            performs.
+
         Args:
             source: Source site identifier
             active_product_keys: Set of product keys that are still active
