@@ -49,6 +49,56 @@ class CSVExportService:
         self._changes_collection = db.data_changes
         self._mapper = get_product_mapper()
 
+    # ------------------------------------------------------------------
+    # Soft-delete filter helper
+    #
+    # ``scraped_products`` is mutated by the worker's
+    # :class:`StreamingTrackedWriter`. When a previously-stored product
+    # disappears from the upstream catalog the writer sets ``deleted_at``
+    # on the doc (a *soft* delete, the doc stays in the collection so we
+    # keep an audit trail and a stable snapshot for change tracking).
+    #
+    # When the same product key reappears in a later scrape the writer
+    # explicitly sets ``deleted_at: None`` to "un-delete" it (see
+    # ``StreamingTrackedWriter.process_batch``). That means a doc is
+    # considered ALIVE iff ``deleted_at`` is missing OR is null.
+    #
+    # Every export path that surfaces ``scraped_products`` rows MUST
+    # honour this so we don't ship tombstoned data to consumers.
+    # ``scrape_results`` is a different collection that has no
+    # soft-delete concept, so the filter is product-collection-only.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _alive_filter() -> Dict[str, Any]:
+        """Mongo predicate for non-soft-deleted ``scraped_products`` docs."""
+        return {
+            "$or": [
+                {"deleted_at": {"$exists": False}},
+                {"deleted_at": None},
+            ]
+        }
+
+    @classmethod
+    def _add_alive_filter(cls, query: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge the alive predicate into an existing query, preserving any
+        $or the caller may already have set (we $and them together rather
+        than overwriting).
+
+        The product/results endpoints don't currently combine $or with
+        anything else, but doing this defensively means future filters
+        won't silently drop the tombstone exclusion.
+        """
+        alive = cls._alive_filter()
+        if "$or" in query:
+            existing_or = query.pop("$or")
+            existing_and = query.pop("$and", [])
+            query["$and"] = existing_and + [{"$or": existing_or}, alive]
+        elif "$and" in query:
+            query["$and"] = query["$and"] + [alive]
+        else:
+            query.update(alive)
+        return query
+
     async def export_products_csv(
         self,
         source: Optional[str] = None,
@@ -128,7 +178,12 @@ class CSVExportService:
     ):
         query: Dict[str, Any] = {}
         if source:
-            query["source"] = source.lower()
+            # Source ids in scraped_products / scrape_results are stored
+            # as the canonical lowercase site_id from the scraper registry.
+            # Don't force-lowercase here — match the same convention used
+            # by the changes endpoint so a mixed-case caller fails loudly
+            # (returns nothing) rather than silently masking a typo.
+            query["source"] = source
 
         date_filter: Dict[str, Any] = {}
         if start_date:
@@ -138,6 +193,11 @@ class CSVExportService:
         if date_filter:
             date_field = "updated_at" if use_products_collection else "created_at"
             query[date_field] = date_filter
+
+        if use_products_collection:
+            # Drop soft-deleted rows. ``scrape_results`` has no soft-delete
+            # concept, so the filter is product-collection-only.
+            self._add_alive_filter(query)
 
         collection = (
             self._products_collection
@@ -259,7 +319,7 @@ class CSVExportService:
         """
         query = {}
         if source:
-            query["source"] = source.lower()
+            query["source"] = source
 
         date_filter = {}
         if start_date:
@@ -269,10 +329,17 @@ class CSVExportService:
         if date_filter:
             query["updated_at"] = date_filter
 
-        # Get counts
-        products_count = await self._products_collection.count_documents(query)
+        # Mirror the export's tombstone exclusion so the headline stats
+        # (``products_collection_count``) match what an actual CSV
+        # download would produce.
+        products_query = self._add_alive_filter(dict(query))
 
-        # Adjust query for results collection
+        # Get counts
+        products_count = await self._products_collection.count_documents(
+            products_query
+        )
+
+        # Adjust query for results collection (no soft-delete concept here).
         results_query = dict(query)
         if "updated_at" in results_query:
             results_query["created_at"] = results_query.pop("updated_at")
@@ -289,9 +356,12 @@ class CSVExportService:
         csv_columns_count = len(CSV_COLUMNS)
         extra: Dict[str, Any] = {}
 
-        # customnapkinsnow-specific variant / tier stats
+        # customnapkinsnow-specific variant / tier stats — also operates
+        # on the product collection so it must use the alive-filtered query.
         if (source or "").lower() == _CNN_SOURCE:
-            max_tiers, variants_total, _ = await self._scan_max_tiers_and_count(query)
+            max_tiers, variants_total, _ = await self._scan_max_tiers_and_count(
+                products_query
+            )
             extra["variants_total_count"] = variants_total
             extra["max_tiers_observed"] = max_tiers
             csv_columns_count = len(cnn_mapper.build_column_list(max_tiers))
@@ -321,9 +391,13 @@ class CSVExportService:
         variant rows (NOT products) built by the v2 mapper.  For every other
         source returns the legacy flat-row preview.
         """
-        query = {}
+        query: Dict[str, Any] = {}
         if source:
-            query["source"] = source.lower()
+            query["source"] = source
+
+        # Preview operates on the products collection — must respect
+        # tombstones so the preview matches the actual CSV download.
+        self._add_alive_filter(query)
 
         if (source or "").lower() == _CNN_SOURCE:
             # First pass to compute max_tiers (same rule as the CSV export)
@@ -376,10 +450,9 @@ class CSVExportService:
         the legacy single-pass stream.  The first pass is a count-style
         projection and remains memory-cheap.
         """
-        query: Dict[str, Any] = {"deleted_at": {"$exists": False}}
-
+        query: Dict[str, Any] = {}
         if source:
-            query["source"] = source.lower()
+            query["source"] = source
 
         date_filter: Dict[str, Any] = {}
         if start_date:
@@ -388,6 +461,13 @@ class CSVExportService:
             date_filter["$lte"] = end_date
         if date_filter:
             query["updated_at"] = date_filter
+
+        # Tombstone exclusion — covers both ``deleted_at`` absent (never
+        # soft-deleted) and ``deleted_at: None`` (revived after a prior
+        # soft-delete via ``StreamingTrackedWriter.process_batch``).
+        # Previously this was ``{"deleted_at": {"$exists": False}}`` which
+        # incorrectly hid revived docs.
+        self._add_alive_filter(query)
 
         # --- customnapkinsnow v2 streaming ---------------------------------
         if (source or "").lower() == _CNN_SOURCE:
