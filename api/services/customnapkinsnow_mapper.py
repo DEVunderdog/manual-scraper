@@ -271,9 +271,30 @@ def _variant_identity_cells(variant: Optional[Dict[str, Any]]) -> Dict[str, str]
     }
 
 
-def _tier_cells(variant: Optional[Dict[str, Any]], max_tiers: int) -> Dict[str, str]:
+def _tier_cells(
+    variant: Optional[Dict[str, Any]],
+    max_tiers: int,
+    fallback_tiers: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, str]:
+    """
+    Render the ``QtyBreak1..QtyBreakN`` / ``Price1..PriceN`` cells for a
+    variant.
+
+    Tier source preference:
+      1. ``variant["tiers"]`` if it is a non-empty list,
+      2. ``fallback_tiers`` (typically the product's ``base_tiers``)
+         when the variant carries no tier copy of its own.
+
+    The fallback exists because every variant is expected to carry a
+    deep-copy of ``base_tiers`` (set by the scraper's ``_make_variant``),
+    but defensive code should still produce populated tier columns when a
+    legacy/partial document only has the product-level ``base_tiers``
+    populated. Without this fallback the CSV silently emits empty
+    QtyBreak/Price cells for every such variant.
+    """
     cells: Dict[str, str] = {}
-    tiers = (variant or {}).get("tiers") or []
+    raw_tiers = (variant or {}).get("tiers") or []
+    tiers = raw_tiers if raw_tiers else (fallback_tiers or [])
     for i in range(max_tiers):
         q_col = f"QtyBreak{i + 1}"
         p_col = f"Price{i + 1}"
@@ -298,17 +319,33 @@ def variants_of(doc: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def max_tiers_for_docs(docs: Iterable[Dict[str, Any]]) -> int:
-    """Compute the largest tier count across every variant in ``docs``."""
+    """Compute the largest tier count across every variant in ``docs``.
+
+    When a doc's variants carry empty ``tiers`` lists we still consider
+    the product-level ``base_tiers`` length so the dynamic
+    ``QtyBreakN``/``PriceN`` column count survives partial / legacy
+    documents — matching the fallback applied by :func:`_tier_cells`.
+    """
     out = 0
     for doc in docs:
-        for v in variants_of(doc):
-            n = len(v.get("tiers") or [])
-            if n > out:
-                out = n
-        # Deal/0-variant products: consider base_tiers as a fallback source
         bt = doc.get("base_tiers") or []
-        if len(bt) > out:
-            out = len(bt)
+        bt_len = len(bt)
+        variants = variants_of(doc)
+        if variants:
+            doc_max = 0
+            for v in variants:
+                n = len(v.get("tiers") or [])
+                if n > doc_max:
+                    doc_max = n
+            # Fallback to base_tiers when no variant carries a tier copy.
+            if doc_max == 0 and bt_len > doc_max:
+                doc_max = bt_len
+            if doc_max > out:
+                out = doc_max
+        else:
+            # Deal/0-variant products: consider base_tiers as the source.
+            if bt_len > out:
+                out = bt_len
     return out
 
 
@@ -325,13 +362,14 @@ def build_rows_for_product(
     has_pricing = _product_has_pricing(doc, variants)
     product_cells = _product_level_cells(doc, has_pricing=has_pricing)
     product_json = _product_json_blob(doc)
+    base_tiers = doc.get("base_tiers") or None
 
     if not variants:
-        # Single empty-variant row
+        # Single empty-variant row — fall back to base_tiers for QtyBreak/Price.
         row: Dict[str, str] = {}
         row.update(product_cells)
         row.update(_variant_identity_cells(None))
-        row.update(_tier_cells(None, max_tiers))
+        row.update(_tier_cells(None, max_tiers, fallback_tiers=base_tiers))
         row["Variant JSON"] = "{}"
         row["Product JSON"] = product_json
         return [row]
@@ -341,7 +379,9 @@ def build_rows_for_product(
         row = {}
         row.update(product_cells)
         row.update(_variant_identity_cells(variant))
-        row.update(_tier_cells(variant, max_tiers))
+        row.update(
+            _tier_cells(variant, max_tiers, fallback_tiers=base_tiers)
+        )
         row["Variant JSON"] = _dumps(variant)
         row["Product JSON"] = product_json
         rows.append(row)

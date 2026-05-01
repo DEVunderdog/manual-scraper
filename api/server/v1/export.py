@@ -13,7 +13,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from api.server.dependencies import CurrentUserDep, DbDep
-from api.services.csv_export_service import get_csv_export_service
+from api.services.csv_export_service import (
+    _normalize_source_for_query,
+    get_csv_export_service,
+)
 from api.services import customnapkinsnow_mapper as cnn_mapper
 from api.schemas.csv_schema import CSV_COLUMNS
 
@@ -72,7 +75,7 @@ async def get_csv_columns(
     dynamically so a UI/script can build a matching header preview for the
     current data.
     """
-    if (source or "").lower() == "customnapkinsnow":
+    if _normalize_source_for_query(source) == "customnapkinsnow":
         service = get_csv_export_service(db)
         max_tiers, _, _ = await service._scan_max_tiers_and_count(
             {"source": "customnapkinsnow"}
@@ -347,7 +350,7 @@ async def preview_export_data(
 
     # v2 customnapkinsnow preview returns one row per variant — surface the
     # underlying product_count and max_tiers so the tester can correlate.
-    if (source or "").lower() == "customnapkinsnow":
+    if _normalize_source_for_query(source) == "customnapkinsnow":
         max_tiers, variants_total, product_count = (
             await export_service._scan_max_tiers_and_count({"source": "customnapkinsnow"})
         )

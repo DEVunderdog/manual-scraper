@@ -31,6 +31,48 @@ STREAM_BATCH_SIZE = 100
 _CNN_SOURCE = "customnapkinsnow"
 
 
+def _normalize_source_for_query(source: Optional[str]) -> Optional[str]:
+    """
+    Normalize a caller-supplied ``source`` to the canonical lowercase form
+    used in storage.
+
+    Background: every scraper registers its ``site_id`` in
+    :func:`shared.scrapers.registry.register_scraper` as a lowercase string,
+    and :class:`worker.database.product.StreamingTrackedWriter` overwrites
+    each product's ``source`` field with that lowercase ``site_id`` before
+    upsert (see ``set_doc["source"] = self._source`` in ``process_batch``).
+    So every doc in ``scraped_products`` and ``data_changes`` has a
+    lowercase ``source`` value.
+
+    Yet the CSV row's ``Source`` *cell* is rendered uppercase
+    (``"CUSTOMNAPKINSNOW"``) by both mappers — meaning any caller that
+    round-trips that displayed value back into ``?source=...`` would
+    otherwise get a silent zero-row export (filter mismatch on case).
+    Normalizing here closes that asymmetry without touching storage.
+
+    Returns ``None`` unchanged so callers' "no filter" semantics are
+    preserved.
+    """
+    if source is None:
+        return None
+    return source.strip().lower() or None
+
+
+def _safe_query(query: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Render a Mongo query dict for safe inclusion in a structured log.
+
+    Strips operators that don't add diagnostic value (the alive-filter $or
+    is the same on every export call) so the log stays readable.
+    """
+    out: Dict[str, Any] = {}
+    for k, v in query.items():
+        if k in ("$or", "$and"):
+            continue
+        out[k] = v
+    return out
+
+
 class CSVExportService:
     """
     Service for exporting scraped product data as CSV.
@@ -123,7 +165,7 @@ class CSVExportService:
         )
 
         # --- customnapkinsnow v2 single-source path --------------------------
-        if (source or "").lower() == _CNN_SOURCE and use_products_collection:
+        if _normalize_source_for_query(source) == _CNN_SOURCE and use_products_collection:
             return await self._export_customnapkinsnow_csv(query)
 
         # --- Legacy path (all other sources) ---------------------------------
@@ -177,13 +219,22 @@ class CSVExportService:
         use_products_collection: bool,
     ):
         query: Dict[str, Any] = {}
-        if source:
+        normalized_source = _normalize_source_for_query(source)
+        if normalized_source:
             # Source ids in scraped_products / scrape_results are stored
-            # as the canonical lowercase site_id from the scraper registry.
-            # Don't force-lowercase here — match the same convention used
-            # by the changes endpoint so a mixed-case caller fails loudly
-            # (returns nothing) rather than silently masking a typo.
-            query["source"] = source
+            # as the canonical lowercase site_id from the scraper registry
+            # (see ``StreamingTrackedWriter`` for the storage convention).
+            # We normalize the caller-supplied value to lowercase so a
+            # round-tripped CSV "Source" cell (which we render uppercase)
+            # still matches. Casers that need exact-match semantics must
+            # not be possible here because the registry guarantees lowercase.
+            query["source"] = normalized_source
+            if source != normalized_source:
+                logger.debug(
+                    "csv_export.source.normalized",
+                    received=source,
+                    normalized=normalized_source,
+                )
 
         date_filter: Dict[str, Any] = {}
         if start_date:
@@ -234,6 +285,17 @@ class CSVExportService:
                     n = len(v.get("tiers") or [])
                     if n > n_doc_max:
                         n_doc_max = n
+                # Defensive: when variants exist but every variant has an
+                # empty `tiers` list, fall back to the product-level
+                # ``base_tiers`` for sizing. Without this fallback a doc
+                # whose per-variant tier copy was lost (e.g. legacy or
+                # partially-stored data) would silently size the dynamic
+                # ``QtyBreakN``/``PriceN`` columns to zero, producing a
+                # tier-less CSV even though ``base_tiers`` is populated.
+                if n_doc_max == 0:
+                    bt = doc.get("base_tiers") or []
+                    if len(bt) > n_doc_max:
+                        n_doc_max = len(bt)
             else:
                 total_variants += 1  # zero-variant products still emit 1 row
                 bt = doc.get("base_tiers") or []
@@ -247,7 +309,30 @@ class CSVExportService:
         self, query: Dict[str, Any]
     ) -> Tuple[str, int]:
         """Two-pass in-memory export for customnapkinsnow (non-streaming)."""
-        max_tiers, _, _ = await self._scan_max_tiers_and_count(query)
+        max_tiers, total_variants, product_count = (
+            await self._scan_max_tiers_and_count(query)
+        )
+
+        if product_count == 0:
+            # Loud signal so an operator can correlate "empty CSV" with a
+            # filter that matched nothing in storage (most commonly a
+            # casing mismatch — addressed by ``_normalize_source_for_query``
+            # but other filters like date range can also produce this).
+            logger.warning(
+                "csv_export.cnn.empty_query_match",
+                query=_safe_query(query),
+            )
+        elif max_tiers == 0:
+            # We did match products but inferred zero tiers. This means
+            # both ``variants[].tiers`` and product-level ``base_tiers``
+            # are empty across every matched doc — unusual, surface it.
+            logger.warning(
+                "csv_export.cnn.no_tiers_observed",
+                products=product_count,
+                total_variants=total_variants,
+                query=_safe_query(query),
+            )
+
         columns = cnn_mapper.build_column_list(max_tiers)
 
         output = io.StringIO()
@@ -318,8 +403,9 @@ class CSVExportService:
         For every other source the response shape is unchanged.
         """
         query = {}
-        if source:
-            query["source"] = source
+        normalized_source = _normalize_source_for_query(source)
+        if normalized_source:
+            query["source"] = normalized_source
 
         date_filter = {}
         if start_date:
@@ -358,7 +444,7 @@ class CSVExportService:
 
         # customnapkinsnow-specific variant / tier stats — also operates
         # on the product collection so it must use the alive-filtered query.
-        if (source or "").lower() == _CNN_SOURCE:
+        if _normalize_source_for_query(source) == _CNN_SOURCE:
             max_tiers, variants_total, _ = await self._scan_max_tiers_and_count(
                 products_query
             )
@@ -372,7 +458,7 @@ class CSVExportService:
             "available_sources": all_sources,
             "csv_columns_count": csv_columns_count,
             "filter_applied": {
-                "source": source,
+                "source": normalized_source,
                 "start_date": start_date.isoformat() if start_date else None,
                 "end_date": end_date.isoformat() if end_date else None,
             },
@@ -392,14 +478,15 @@ class CSVExportService:
         source returns the legacy flat-row preview.
         """
         query: Dict[str, Any] = {}
-        if source:
-            query["source"] = source
+        normalized_source = _normalize_source_for_query(source)
+        if normalized_source:
+            query["source"] = normalized_source
 
         # Preview operates on the products collection — must respect
         # tombstones so the preview matches the actual CSV download.
         self._add_alive_filter(query)
 
-        if (source or "").lower() == _CNN_SOURCE:
+        if _normalize_source_for_query(source) == _CNN_SOURCE:
             # First pass to compute max_tiers (same rule as the CSV export)
             max_tiers, _, _ = await self._scan_max_tiers_and_count(query)
             cursor = self._products_collection.find(query).sort("created_at", -1)
@@ -451,8 +538,9 @@ class CSVExportService:
         projection and remains memory-cheap.
         """
         query: Dict[str, Any] = {}
-        if source:
-            query["source"] = source
+        normalized_source = _normalize_source_for_query(source)
+        if normalized_source:
+            query["source"] = normalized_source
 
         date_filter: Dict[str, Any] = {}
         if start_date:
@@ -470,7 +558,7 @@ class CSVExportService:
         self._add_alive_filter(query)
 
         # --- customnapkinsnow v2 streaming ---------------------------------
-        if (source or "").lower() == _CNN_SOURCE:
+        if _normalize_source_for_query(source) == _CNN_SOURCE:
             async for chunk in self._stream_customnapkinsnow_csv(
                 query, batch_size=batch_size
             ):
@@ -533,7 +621,23 @@ class CSVExportService:
         self, query: Dict[str, Any], batch_size: int
     ) -> AsyncGenerator[str, None]:
         """Two-pass streaming writer for the customnapkinsnow source."""
-        max_tiers, _, _ = await self._scan_max_tiers_and_count(query)
+        max_tiers, total_variants, product_count = (
+            await self._scan_max_tiers_and_count(query)
+        )
+
+        if product_count == 0:
+            logger.warning(
+                "csv_stream.cnn.empty_query_match",
+                query=_safe_query(query),
+            )
+        elif max_tiers == 0:
+            logger.warning(
+                "csv_stream.cnn.no_tiers_observed",
+                products=product_count,
+                total_variants=total_variants,
+                query=_safe_query(query),
+            )
+
         columns = cnn_mapper.build_column_list(max_tiers)
 
         # Header
@@ -612,14 +716,14 @@ class CSVExportService:
         """
         # Build query
         query = {}
-        if source:
-            # NOTE: change records store ``source`` exactly as the scraper
-            # registered it (always lowercase by convention — see
-            # ``register_scraper`` site_id values). Do NOT force-lowercase
-            # the filter here: if a caller ever filters on a source whose
-            # canonical id is mixed-case, lowercasing silently drops every
-            # match. Trust the caller; the registry is the source of truth.
-            query["source"] = source
+        normalized_source = _normalize_source_for_query(source)
+        if normalized_source:
+            # change records store ``source`` as the canonical lowercase
+            # site_id (the scraper registry guarantees lowercase ids and
+            # ``StreamingTrackedWriter`` propagates it on write). We
+            # normalize here so a CSV-round-tripped uppercase value still
+            # matches — see ``_normalize_source_for_query``.
+            query["source"] = normalized_source
         if change_type:
             query["change_type"] = change_type
 
@@ -784,11 +888,12 @@ class CSVExportService:
 
         start_date = datetime.now(timezone.utc) - timedelta(days=days)
 
+        normalized_source = _normalize_source_for_query(source)
         pipeline = [
             {
                 "$match": {
                     "created_at": {"$gte": start_date},
-                    **({"source": source} if source else {}),
+                    **({"source": normalized_source} if normalized_source else {}),
                 }
             },
             {
